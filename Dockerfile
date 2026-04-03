@@ -20,23 +20,18 @@ RUN apk update && apk add --no-cache \
     openssh \
     jq \
     chromium \
-    chromium-chromedriver
+    chromium-chromedriver \
+    nodejs \
+    npm
 
-# Conditionally install Node.js and npm for n8n
-RUN if [ "$INSTALL_N8N" = "true" ]; then \
-        apk add --no-cache nodejs npm; \
-        echo "Node.js version: $(node --version)"; \
-        echo "npm version: $(npm --version)"; \
-    else \
-        echo "Skipping Node.js/npm installation (INSTALL_N8N=false)"; \
-    fi
-
-# Verify Python 3.12 installation
-RUN echo "Python version: $(python3 --version)" && \
+# Verify installations
+RUN echo "Node.js version: $(node --version)" && \
+    echo "npm version: $(npm --version)" && \
+    echo "Python version: $(python3 --version)" && \
     echo "Pip version: $(pip3 --version)" && \
     echo "Git version: $(git --version)"
 
-# Install n8n globally FIRST (most expensive step) - only if enabled
+# Install n8n globally - only if enabled
 RUN if [ "$INSTALL_N8N" = "true" ]; then \
         npm install -g n8n; \
         echo "n8n version: $(n8n --version)"; \
@@ -44,7 +39,7 @@ RUN if [ "$INSTALL_N8N" = "true" ]; then \
         echo "Skipping n8n installation (INSTALL_N8N=false)"; \
     fi
 
-# Install ngrok (expensive but stable) - only if enabled
+# Install ngrok - only if enabled
 RUN if [ "$INSTALL_NGROK" = "true" ]; then \
         curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
         | tar xz -C /usr/local/bin; \
@@ -53,7 +48,7 @@ RUN if [ "$INSTALL_NGROK" = "true" ]; then \
         echo "Skipping ngrok installation (INSTALL_NGROK=false)"; \
     fi
 
-# Create node user (stable) - only if n8n is enabled
+# Create node user for n8n (only if enabled)
 RUN if [ "$INSTALL_N8N" = "true" ]; then \
         addgroup -g 1000 node && \
         adduser -u 1000 -G node -s /bin/sh -D node; \
@@ -62,7 +57,7 @@ RUN if [ "$INSTALL_N8N" = "true" ]; then \
         echo "Skipping node user creation (INSTALL_N8N=false)"; \
     fi
 
-# Configure SSH (stable)
+# Configure SSH
 RUN ssh-keygen -A && \
     mkdir -p /var/run/sshd && \
     echo 'root:Secure@FreeRender2024' | chpasswd && \
@@ -80,7 +75,8 @@ ARG INSTALL_NGROK=true
 RUN mkdir -p /var/log/nginx \
     && mkdir -p /run/nginx \
     && mkdir -p /var/cache/nginx \
-    && mkdir -p /var/www
+    && mkdir -p /var/www \
+    && mkdir -p /app
 
 # Create n8n directories only if n8n is enabled
 RUN if [ "$INSTALL_N8N" = "true" ]; then \
@@ -90,10 +86,16 @@ RUN if [ "$INSTALL_N8N" = "true" ]; then \
         echo "Skipping n8n directory creation (INSTALL_N8N=false)"; \
     fi
 
-# Copy configuration files
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY start_services.sh /start_services.sh
-RUN chmod +x /start_services.sh
+# Clone and build AsambleasReact
+WORKDIR /app
+RUN git clone https://github.com/rivascel/AsambleasReact.git asambleas
+WORKDIR /app/asambleas
+RUN npm install && npm run build
+
+# Copy configuration files (you need to create these)
+# COPY nginx.conf /etc/nginx/nginx.conf
+# COPY start_services.sh /start_services.sh
+# RUN chmod +x /start_services.sh
 
 # Fix permissions
 RUN chown -R nginx:nginx /var/log/nginx /var/cache/nginx /run/nginx
@@ -106,47 +108,48 @@ RUN if [ "$INSTALL_N8N" = "true" ]; then \
         echo "Skipping n8n permission setup (INSTALL_N8N=false)"; \
     fi
 
-# Set environment variables for n8n (only if enabled)
-RUN if [ "$INSTALL_N8N" = "true" ]; then \
-        echo "Setting n8n environment variables"; \
-    else \
-        echo "Skipping n8n environment variables (INSTALL_N8N=false)"; \
-    fi
-
-# n8n environment variables (will be ignored if n8n not installed)
-ENV N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=false
+# Environment variables
+ENV N8N_ENABLED=${INSTALL_N8N}
 ENV N8N_HOST=0.0.0.0
 ENV N8N_PORT=5678
 ENV N8N_PROTOCOL=http
 ENV N8N_PATH=/n8n/
 ENV N8N_DIAGNOSTICS_ENABLED=false
 ENV N8N_ANONYMOUS_USAGE=false
-ENV N8N_DISABLE_PRODUCTION_MAIN_PROCESS=true
 
-# Set environment variables for optional services
-ENV N8N_ENABLED=false
-ENV NGROK_ENABLED=false
-ENV NGROK_AUTHTOKEN=
+# Create Nginx configuration
+RUN echo 'server { \
+    listen 80; \
+    server_name _; \
+    \
+    location /asambleas { \
+        alias /app/asambleas/build; \
+        try_files $uri $uri/ /index.html; \
+        index index.html; \
+    } \
+    \
+    location /n8n/ { \
+        proxy_pass http://localhost:5678/; \
+        proxy_http_version 1.1; \
+        proxy_set_header Upgrade $http_upgrade; \
+        proxy_set_header Connection "upgrade"; \
+        proxy_set_header Host $host; \
+        proxy_set_header X-Real-IP $remote_addr; \
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; \
+        proxy_set_header X-Forwarded-Proto $scheme; \
+    } \
+    \
+    location / { \
+        return 200 "Server is running.\nAccess n8n at /n8n\nAccess Asambleas at /asambleas\n"; \
+        add_header Content-Type text/plain; \
+    } \
+}' > /etc/nginx/http.d/default.conf
 
-# GreyTHR Attendance System environment variables
-ENV GREYTHR_ENABLED=true
-ENV GREYTHR_URL=
-ENV GREYTHR_USERNAME=
-ENV GREYTHR_PASSWORD=
+# Expose ports
+EXPOSE 80 5678 22
 
-# Copy GreyTHR Attendance System
-COPY greythr-attendance-system /greythr-attendance-system
-WORKDIR /greythr-attendance-system
-
-# Setup GreyTHR environment using the existing setup script
-RUN chmod +x server.sh && \
-    ./server.sh setup
-
-# Return to root directory
-WORKDIR /
-
-# Expose port 80 for nginx
-EXPOSE 80
-
-# Use the startup script
-CMD ["/start_services.sh"]
+# Start services
+CMD if [ "$N8N_ENABLED" = "true" ]; then \
+        n8n start & \
+    fi; \
+    nginx -g "daemon off;"
